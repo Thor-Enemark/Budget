@@ -1,0 +1,1350 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fælles budget - Forbrug</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    /* ------------------------------------------------------------------ */
+    /*  Kategorier                                                         */
+    /* ------------------------------------------------------------------ */
+
+    const slug = (s) =>
+      s
+        .toLowerCase()
+        .replace(/æ/g, "ae")
+        .replace(/ø/g, "oe")
+        .replace(/å/g, "aa")
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "");
+
+    const SEED = [
+      ["Bolig", ["Husleje eller boliglån", "El", "Vand", "Varme", "Internet og TV", "Indboforsikring", "Vedligehold"]],
+      ["Transport", ["Bil eller leasing", "Bilforsikring og ejerafgift", "Brændstof og opladning", "Service og reparation", "Offentlig transport", "Parkering"]],
+      ["Mad og dagligvarer", ["Dagligvarer", "Restaurant og takeaway", "Café og bar", "Frokost på arbejdet"]],
+      ["Abonnementer", ["Mobil", "Streaming og medier", "Aviser og magasiner", "Apps og software", "Medlemskaber"]],
+      ["Forsikring og sundhed", ["Ulykkes- og livsforsikring", "Sundhedsforsikring", "Læge, tandlæge og medicin", "Briller og linser", "Fitness"]],
+      ["Personligt", ["Tøj og shopping", "Frisør og personlig pleje", "Fritid og hobby", "Bøger, spil og kultur", "Gaver"]],
+      ["Børn og familie", ["Daginstitution og SFO", "Børnetøj og udstyr", "Fritidsaktiviteter", "Børneopsparing"]],
+      ["Kæledyr", ["Foder og udstyr", "Dyrlæge og forsikring"]],
+      ["Rejser og ferie", ["Rejser og ophold", "Forbrug på ferien", "Ferieopsparing"]],
+      ["Opsparing og gæld", ["Opsparing", "Pension", "Investering", "Afdrag på lån", "SU-lån og studiegæld"]],
+      ["Andet", ["Donationer", "Uforudsete udgifter", "Andet"]],
+    ];
+
+    const DEFAULT_CATS = SEED.map(([name, subs]) => ({
+      id: "g-" + slug(name),
+      name,
+      subs: subs.map((s) => ({ id: "s-" + slug(s), name: s })),
+    }));
+
+    const LEGACY = {
+      Bolig: "Husleje eller boliglån", Mad: "Dagligvarer", Shopping: "Tøj og shopping",
+      Transport: "Offentlig transport", Abonnementer: "Streaming og medier", Forsikring: "Indboforsikring",
+      Fritid: "Fritid og hobby", Restaurant: "Restaurant og takeaway", Sundhed: "Læge, tandlæge og medicin",
+      Opsparing: "Opsparing", Andet: "Andet", "El, vand og varme": "El",
+      "Bil: afdrag eller leasing": "Bil eller leasing", "Bil: forsikring og ejerafgift": "Bilforsikring og ejerafgift",
+      "Brændstof eller opladning": "Brændstof og opladning", "Service, dæk og reparation": "Service og reparation",
+      "Parkering og broafgift": "Parkering", "Vedligehold og indretning": "Vedligehold",
+      "Ejerudgifter og grundskyld": "Husleje eller boliglån", "Fitness og træning": "Fitness",
+      "Flybilletter og ophold": "Rejser og ophold", Cykel: "Offentlig transport",
+    };
+
+    /* ------------------------------------------------------------------ */
+    /*  Rytme, datoer, format                                              */
+    /* ------------------------------------------------------------------ */
+
+    const FREQ = {
+      m: { short: "md.", long: "hver måned", per: 1 },
+      q: { short: "kvt.", long: "hvert kvartal", per: 3 },
+      y: { short: "år", long: "en gang om året", per: 12 },
+    };
+    const FREQ_ORDER = ["m", "q", "y"];
+    const perMonth = (x) => (+x.amount || 0) / FREQ[x.freq || "m"].per;
+
+    const pad = (n) => String(n).padStart(2, "0");
+    const mkOf = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+    const shiftMonth = (mk, delta) => {
+      const [y, m] = mk.split("-").map(Number);
+      return mkOf(new Date(y, m - 1 + delta, 1));
+    };
+    const monthName = (mk, style = "long") => {
+      const [y, m] = mk.split("-").map(Number);
+      const s = new Date(y, m - 1, 1).toLocaleDateString("da-DK", { month: style, year: "numeric" });
+      return s.charAt(0).toUpperCase() + s.slice(1);
+    };
+    const shortMonth = (mk) => {
+      const [y, m] = mk.split("-").map(Number);
+      return new Date(y, m - 1, 1).toLocaleDateString("da-DK", { month: "short" }).replace(".", "");
+    };
+
+    const kr = (n) =>
+      new Intl.NumberFormat("da-DK", { maximumFractionDigits: 0 }).format(Math.round(n || 0)) + " kr";
+
+    const dayLabel = (iso) => {
+      const d = new Date(iso + "T00:00:00");
+      return isNaN(d) ? "" : d.toLocaleDateString("da-DK", { day: "numeric", month: "short" });
+    };
+
+    /* ------------------------------------------------------------------ */
+
+    const KEY = "budget-dashboard";
+    const uid = () => Math.random().toString(36).slice(2, 9);
+    const PLAN_BUCKET = { a: "mine", b: "theirs", j: "shared" };
+
+    const START = {
+      names: { a: "Dig", b: "Kæreste" },
+      incomes: { a: 0, b: 0 },
+      split: "even",
+      cats: DEFAULT_CATS,
+      shared: [],
+      mine: [],
+      theirs: [],
+      entries: [],
+      limits: [],
+      settlements: [],
+    };
+
+    const findSub = (cats, id) => {
+      for (const g of cats) for (const sub of g.subs) if (sub.id === id) return { sub, group: g };
+      return null;
+    };
+
+    function migrate(raw) {
+      const s = { ...START, ...raw };
+      if (!Array.isArray(s.cats) || s.cats.length === 0) s.cats = DEFAULT_CATS;
+
+      const byName = {};
+      for (const g of s.cats) for (const sub of g.subs) byName[sub.name] = sub.id;
+      const first = s.cats[0].subs[0].id;
+      const toId = (c) => {
+        if (!c) return first;
+        if (byName[c]) return byName[c];
+        const legacy = LEGACY[c];
+        return (legacy && byName[legacy]) || byName["Andet"] || first;
+      };
+
+      for (const b of ["shared", "mine", "theirs"])
+        s[b] = (s[b] || []).map((x) => ({
+          ...x,
+          freq: FREQ[x.freq] ? x.freq : "m",
+          catId: x.catId && findSub(s.cats, x.catId) ? x.catId : toId(x.cat),
+          cat: undefined,
+        }));
+
+      s.entries = (s.entries || []).map((x) => ({
+        ...x,
+        catId: x.catId && findSub(s.cats, x.catId) ? x.catId : first,
+        owner: x.owner || "j",
+        payer: x.payer || "j",
+      }));
+
+      const groupByName = {};
+      for (const g of s.cats) groupByName[g.name] = g.id;
+      s.limits = (s.limits || []).map((l) => {
+        const owner = l.owner || "a";
+        if (l.target && (findSub(s.cats, l.target.slice(2)) || s.cats.some((g) => g.id === l.target.slice(2))))
+          return { ...l, owner };
+        const t = l.target || "s:" + (l.cat || "Andet");
+        return {
+          ...l,
+          owner,
+          target: t.slice(0, 1) === "g" ? "g:" + (groupByName[t.slice(2)] || s.cats[0].id) : "s:" + toId(t.slice(2)),
+        };
+      });
+
+      const now = mkOf(new Date());
+      s.settlements = (s.settlements || []).map((x) => ({ ...x, mk: x.mk || (x.date || "").slice(0, 7) || now }));
+      return s;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Byggeklodser                                                       */
+    /* ------------------------------------------------------------------ */
+
+    function CatSelect({ cats, value, onChange, className }) {
+      return (
+        <select className={className} value={value} onChange={(e) => onChange(e.target.value)}>
+          {cats.map((g) => (
+            <optgroup key={g.id} label={g.name}>
+              {g.subs.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name}
+                </option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
+      );
+    }
+
+    /* linje i budgettet (faste, tilbagevendende beløb) */
+    function PlanRow({ item, cats, onChange, onDelete, payerNames }) {
+      const set = (p) => onChange({ ...item, ...p });
+      const freq = item.freq || "m";
+      const cycle = (field, order) => {
+        const cur = item[field] || order[0];
+        set({ [field]: order[(order.indexOf(cur) + 1) % order.length] });
+      };
+      return (
+        <div className="row">
+          <input className="cell cell-name" value={item.name} placeholder="Hvad er det?" onChange={(e) => set({ name: e.target.value })} />
+          <CatSelect cats={cats} className="cell cell-cat" value={item.catId} onChange={(catId) => set({ catId })} />
+          {payerNames && (
+            <button className={`payer p-${item.payer}`} onClick={() => cycle("payer", ["a", "b", "j"])} title="Hvem trækker beløbet?">
+              <span className="dot" />
+              {item.payer === "j" ? "Fælles konto" : payerNames[item.payer]}
+            </button>
+          )}
+          <input
+            className="cell cell-amount"
+            type="number"
+            inputMode="decimal"
+            placeholder="0"
+            value={item.amount === 0 ? "" : item.amount}
+            onChange={(e) => set({ amount: e.target.value === "" ? 0 : Number(e.target.value) })}
+          />
+          <button className={`freq f-${freq}`} onClick={() => cycle("freq", FREQ_ORDER)} title={`Betales ${FREQ[freq].long}`}>
+            pr. {FREQ[freq].short}
+          </button>
+          <button className="del" onClick={onDelete} aria-label="Slet linje">×</button>
+          {freq !== "m" && (+item.amount || 0) > 0 && (
+            <div className="permonth">svarer til {kr(perMonth(item))} om måneden</div>
+          )}
+        </div>
+      );
+    }
+
+    function PlanList({ items, cats, onChange, onAdd, onDelete, payerNames, empty, addLabel }) {
+      return (
+        <>
+          {items.length === 0 ? (
+            <p className="empty">{empty}</p>
+          ) : (
+            items.map((it) => (
+              <PlanRow
+                key={it.id}
+                item={it}
+                cats={cats}
+                payerNames={payerNames}
+                onChange={(next) => onChange(it.id, next)}
+                onDelete={() => onDelete(it.id)}
+              />
+            ))
+          )}
+          <button className="add" onClick={onAdd}>{addLabel}</button>
+        </>
+      );
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  App                                                                */
+    /* ------------------------------------------------------------------ */
+
+    function Budget() {
+      const [d, setD] = useState(START);
+      const [loading, setLoading] = useState(true);
+      const [error, setError] = useState("");
+      const [showReset, setShowReset] = useState(false);
+      const [editCats, setEditCats] = useState(false);
+      const [showPlan, setShowPlan] = useState(false);
+      const [catMode, setCatMode] = useState("actual");
+      const [open, setOpen] = useState({});
+      const [mk, setMk] = useState(mkOf(new Date()));
+      const ready = useRef(false);
+      const dirtyUntil = useRef(0);
+
+      useEffect(() => {
+        let alive = true;
+        (async () => {
+          if (!window.storage) {
+            if (alive) {
+              setLoading(false);
+              setError("Delt lagring er ikke tilgængelig her. Tallene forsvinder, når siden lukkes.");
+            }
+            return;
+          }
+          let next = START;
+          try {
+            const r = await window.storage.get(KEY, true);
+            if (r && r.value) next = migrate(JSON.parse(r.value));
+          } catch {
+            /* første besøg */
+          }
+          if (!alive) return;
+          setD(next);
+          setLoading(false);
+          ready.current = true;
+        })();
+        return () => { alive = false; };
+      }, []);
+
+      useEffect(() => {
+        if (!ready.current || !window.storage) return;
+        const t = setTimeout(async () => {
+          try {
+            const ok = await window.storage.set(KEY, JSON.stringify(d), true);
+            setError(ok ? "" : "Kunne ikke gemme i skyen. Prøv igen.");
+          } catch (err) {
+            setError(err?.message || "Kunne ikke gemme i skyen. Prøv igen.");
+          }
+        }, 600);
+        return () => clearTimeout(t);
+      }, [d]);
+
+      useEffect(() => {
+        if (!window.storage?.subscribe) return;
+        return window.storage.subscribe((value) => {
+          // Beskyt lokale tastetryk mod at blive overskrevet midt i en gemning.
+          if (Date.now() < dirtyUntil.current) return;
+          try {
+            const next = migrate(JSON.parse(value));
+            setD(next);
+            setError("");
+          } catch {
+            // Bevar den aktuelle visning, hvis cloud-data mod forventning er ugyldige.
+          }
+        });
+      }, []);
+
+      const patch = (fn) => {
+        dirtyUntil.current = Date.now() + 1600;
+        setD((s) => ({ ...s, ...fn(s) }));
+      };
+
+      const listOps = (bucket) => ({
+        onChange: (id, next) => patch((s) => ({ [bucket]: s[bucket].map((x) => (x.id === id ? next : x)) })),
+        onDelete: (id) => patch((s) => ({ [bucket]: s[bucket].filter((x) => x.id !== id) })),
+        onAdd: () =>
+          patch((s) => ({
+            [bucket]: [
+              ...s[bucket],
+              { id: uid(), name: "", amount: 0, freq: "m", catId: s.cats[0].subs[0]?.id, ...(bucket === "shared" ? { payer: "j" } : {}) },
+            ],
+          })),
+      });
+
+      /* ---------- kategoristyring ---------- */
+      const countUses = (ids) =>
+        [...d.shared, ...d.mine, ...d.theirs, ...d.entries].filter((x) => ids.includes(x.catId)).length;
+
+      const applyCatRemoval = (nextCats, removedIds) =>
+        patch((s) => {
+          let cats = nextCats;
+          let fallback = cats.flatMap((g) => g.subs)[0];
+          if (!fallback) {
+            fallback = { id: uid(), name: "Andet" };
+            cats = [{ id: uid(), name: "Andet", subs: [fallback] }];
+          }
+          const fix = (arr) => arr.map((x) => (removedIds.includes(x.catId) ? { ...x, catId: fallback.id } : x));
+          return {
+            cats,
+            shared: fix(s.shared), mine: fix(s.mine), theirs: fix(s.theirs), entries: fix(s.entries),
+            limits: s.limits.filter((l) => !removedIds.includes(l.target.slice(2))),
+          };
+        });
+
+      const addGroup = () =>
+        patch((s) => ({ cats: [...s.cats, { id: uid(), name: "Ny kategori", subs: [{ id: uid(), name: "Ny underkategori" }] }] }));
+      const addSub = (gid) =>
+        patch((s) => ({ cats: s.cats.map((g) => (g.id === gid ? { ...g, subs: [...g.subs, { id: uid(), name: "Ny underkategori" }] } : g)) }));
+      const renameGroup = (gid, name) => patch((s) => ({ cats: s.cats.map((g) => (g.id === gid ? { ...g, name } : g)) }));
+      const renameSub = (gid, sid, name) =>
+        patch((s) => ({
+          cats: s.cats.map((g) => (g.id === gid ? { ...g, subs: g.subs.map((x) => (x.id === sid ? { ...x, name } : x)) } : g)),
+        }));
+
+      const deleteSub = (gid, sid) => {
+        const n = countUses([sid]);
+        if (n > 0 && !window.confirm(`${n} ${n === 1 ? "postering flyttes" : "posteringer flyttes"} til den første kategori på listen. Fortsæt?`)) return;
+        const nextCats = d.cats
+          .map((g) => (g.id === gid ? { ...g, subs: g.subs.filter((x) => x.id !== sid) } : g))
+          .filter((g) => g.subs.length > 0);
+        applyCatRemoval(nextCats, [sid, ...(nextCats.some((g) => g.id === gid) ? [] : [gid])]);
+      };
+
+      const deleteGroup = (gid) => {
+        const g = d.cats.find((x) => x.id === gid);
+        const ids = g.subs.map((s) => s.id);
+        const n = countUses(ids);
+        if (!window.confirm(n > 0 ? `"${g.name}" slettes, og ${n} ${n === 1 ? "postering flyttes" : "posteringer flyttes"} til den første kategori på listen. Fortsæt?` : `Slet "${g.name}"?`)) return;
+        applyCatRemoval(d.cats.filter((x) => x.id !== gid), [...ids, gid]);
+      };
+
+      /* ---------- posteringer ---------- */
+      const addEntry = () => {
+        const today = new Date();
+        const date = mk === mkOf(today) ? `${mk}-${pad(today.getDate())}` : `${mk}-01`;
+        patch((s) => ({
+          entries: [...s.entries, { id: uid(), date, name: "", amount: 0, catId: s.cats[0].subs[0]?.id, owner: "j", payer: "a" }],
+        }));
+      };
+      const changeEntry = (id, next) => patch((s) => ({ entries: s.entries.map((x) => (x.id === id ? next : x)) }));
+      const deleteEntry = (id) => patch((s) => ({ entries: s.entries.filter((x) => x.id !== id) }));
+
+      /* ---------- beregninger ---------- */
+      const m = useMemo(() => {
+        const sumPlan = (arr) => arr.reduce((s, x) => s + perMonth(x), 0);
+        const sumRaw = (arr) => arr.reduce((s, x) => s + (+x.amount || 0), 0);
+
+        const planShared = sumPlan(d.shared);
+        const planMine = sumPlan(d.mine);
+        const planTheirs = sumPlan(d.theirs);
+        const planTotal = planShared + planMine + planTheirs;
+
+        const entries = d.entries.filter((x) => (x.date || "").slice(0, 7) === mk);
+        const eShared = sumRaw(entries.filter((x) => x.owner === "j"));
+        const eMine = sumRaw(entries.filter((x) => x.owner === "a"));
+        const eTheirs = sumRaw(entries.filter((x) => x.owner === "b"));
+        const eTotal = eShared + eMine + eTheirs;
+
+        const incA = +d.incomes.a || 0;
+        const incB = +d.incomes.b || 0;
+        const income = incA + incB;
+        const shareA = d.split === "income" && income > 0 ? incA / income : 0.5;
+        const shareB = 1 - shareA;
+
+        /* udlæg: faste fælles udgifter + månedens fælles posteringer */
+        const paidA =
+          sumPlan(d.shared.filter((x) => x.payer === "a")) +
+          sumRaw(entries.filter((x) => x.owner === "j" && x.payer === "a"));
+        const paidB =
+          sumPlan(d.shared.filter((x) => x.payer === "b")) +
+          sumRaw(entries.filter((x) => x.owner === "j" && x.payer === "b"));
+        const pool = paidA + paidB;
+
+        let balanceA = paidA - shareA * pool;
+        for (const s of d.settlements.filter((x) => x.mk === mk))
+          balanceA += s.from === "a" ? s.amount : -s.amount;
+
+        const sharedTotal = planShared + eShared;
+        const mineTotal = planMine + eMine;
+        const theirsTotal = planTheirs + eTheirs;
+        const total = sharedTotal + mineTotal + theirsTotal;
+
+        const leftA = incA - mineTotal - shareA * sharedTotal;
+        const leftB = incB - theirsTotal - shareB * sharedTotal;
+
+        /* kategorier — enten budget eller månedens forbrug */
+        const src =
+          catMode === "plan"
+            ? { j: d.shared, a: d.mine, b: d.theirs }
+            : { j: entries.filter((x) => x.owner === "j"), a: entries.filter((x) => x.owner === "a"), b: entries.filter((x) => x.owner === "b") };
+        const val = catMode === "plan" ? perMonth : (x) => +x.amount || 0;
+        const srcTotal =
+          catMode === "plan" ? planTotal : eTotal;
+
+        const groups = d.cats
+          .map((g) => {
+            const ids = g.subs.map((s) => s.id);
+            const parts = { j: 0, a: 0, b: 0 };
+            const subTotals = {};
+            for (const [k, arr] of Object.entries(src))
+              for (const x of arr) {
+                if (!ids.includes(x.catId)) continue;
+                const v = val(x);
+                parts[k] += v;
+                subTotals[x.catId] = (subTotals[x.catId] || 0) + v;
+              }
+            const tot = parts.j + parts.a + parts.b;
+            return {
+              id: g.id, name: g.name, total: tot, parts,
+              subs: g.subs.map((s) => [s.name, subTotals[s.id] || 0]).filter(([, v]) => v > 0).sort((p, q) => q[1] - p[1]),
+            };
+          })
+          .filter((g) => g.total > 0)
+          .sort((p, q) => q.total - p.total);
+        const groupMax = groups.length ? groups[0].total : 1;
+
+        /* grænser måler faktisk forbrug i den valgte måned */
+        const limits = d.limits.map((l) => {
+          const kind = l.target.slice(0, 1);
+          const id = l.target.slice(2);
+          const group = d.cats.find((g) => g.id === id);
+          const hit = findSub(d.cats, id);
+          const ids = kind === "g" ? (group ? group.subs.map((s) => s.id) : []) : [id];
+          const spent = sumRaw(entries.filter((x) => x.owner === l.owner && ids.includes(x.catId)));
+          const cap = +l.amount || 0;
+          return {
+            ...l,
+            label: kind === "g" ? (group ? group.name : "—") : hit ? hit.sub.name : "—",
+            spent, cap, rest: cap - spent, over: cap > 0 && spent > cap,
+          };
+        });
+        const byOwner = (o) => limits.filter((l) => l.owner === o);
+
+        /* historik */
+        const byMonth = {};
+        for (const x of d.entries) {
+          const k = (x.date || "").slice(0, 7);
+          if (k) byMonth[k] = (byMonth[k] || 0) + (+x.amount || 0);
+        }
+        const hist = [];
+        for (let i = 11; i >= 0; i--) {
+          const k = shiftMonth(mk, -i);
+          hist.push({ mk: k, total: byMonth[k] || 0 });
+        }
+        const histMax = Math.max(1, ...hist.map((h) => h.total));
+        const year = mk.slice(0, 4);
+        const yearTotal = sumRaw(d.entries.filter((x) => (x.date || "").slice(0, 4) === year));
+        const yearMonths = new Set(
+          d.entries.filter((x) => (x.date || "").slice(0, 4) === year).map((x) => x.date.slice(0, 7))
+        ).size;
+
+        const uneven = [...d.shared, ...d.mine, ...d.theirs].filter((x) => (x.freq || "m") !== "m" && (+x.amount || 0) > 0);
+
+        return {
+          planShared, planMine, planTheirs, planTotal,
+          entries, eShared, eMine, eTheirs, eTotal,
+          sharedTotal, mineTotal, theirsTotal, total,
+          incA, incB, income, shareA, shareB,
+          pool, balanceA, leftA, leftB,
+          groups, groupMax, srcTotal,
+          limits, byOwner,
+          hist, histMax, year, yearTotal, yearMonths,
+          uneven,
+        };
+      }, [d, mk, catMode]);
+
+      const settle = () => {
+        const amount = Math.round(Math.abs(m.balanceA));
+        if (amount < 1) return;
+        patch((s) => ({
+          settlements: [
+            ...s.settlements,
+            { id: uid(), mk, amount, from: m.balanceA > 0 ? "b" : "a", date: new Date().toISOString().slice(0, 10) },
+          ],
+        }));
+      };
+
+      const addLimit = (owner) =>
+        patch((s) => ({ limits: [...s.limits, { id: uid(), owner, target: "s:" + s.cats[0].subs[0].id, amount: 0 }] }));
+
+      const wipe = async () => {
+        if (!window.confirm("Slet alle tal? Det kan ikke fortrydes.")) return;
+        try { await window.storage.delete(KEY, true); } catch { /* intet gemt */ }
+        setD(START);
+        setShowReset(false);
+      };
+
+      const N = d.names;
+      const debtor = m.balanceA > 0.5 ? "b" : m.balanceA < -0.5 ? "a" : null;
+      const tilt = m.pool > 0 ? Math.max(-0.42, Math.min(0.42, (m.balanceA / (m.pool / 2)) * 0.42)) : 0;
+      const beamColor = debtor === "b" ? "var(--a)" : debtor === "a" ? "var(--b)" : "var(--muted)";
+      const monthSettlements = d.settlements.filter((x) => x.mk === mk);
+
+      /* ---------- delkomponenter ---------- */
+
+      const Person = ({ p }) => {
+        const inc = p === "a" ? m.incA : m.incB;
+        const own = p === "a" ? m.mineTotal : m.theirsTotal;
+        const share = (p === "a" ? m.shareA : m.shareB) * m.sharedTotal;
+        const left = p === "a" ? m.leftA : m.leftB;
+        const used = inc > 0 ? Math.min(1, (own + share) / inc) : 0;
+        const mineLimits = m.byOwner(p);
+        const over = mineLimits.filter((l) => l.over).length;
+        return (
+          <div className="card person">
+            <div className="p-head">
+              <span className="swatch" style={{ background: `var(--${p})` }} />
+              <input className="p-name" value={N[p]} onChange={(e) => patch((s) => ({ names: { ...s.names, [p]: e.target.value } }))} />
+            </div>
+            <div className="p-line">
+              <span>Indtægt pr. måned</span>
+              <input
+                className="cell cell-amount"
+                type="number"
+                inputMode="decimal"
+                placeholder="0"
+                value={inc === 0 ? "" : inc}
+                onChange={(e) => patch((s) => ({ incomes: { ...s.incomes, [p]: e.target.value === "" ? 0 : Number(e.target.value) } }))}
+              />
+            </div>
+            <div className="p-line quiet"><span>Egne udgifter</span><b>− {kr(own)}</b></div>
+            <div className="p-line quiet">
+              <span>Andel af fælles ({Math.round((p === "a" ? m.shareA : m.shareB) * 100)}%)</span>
+              <b>− {kr(share)}</b>
+            </div>
+            <div className="p-bar"><i style={{ width: `${used * 100}%`, background: `var(--${p})` }} /></div>
+            <div className="p-left">
+              <span>Tilbage</span>
+              <strong className={left < 0 ? "neg" : ""}>{kr(left)}</strong>
+            </div>
+            {mineLimits.length > 0 && (
+              <div className={`p-note ${over ? "neg" : ""}`}>
+                {over === 0
+                  ? `Alle ${mineLimits.length === 1 ? "grænsen holder" : "grænser holder"} i ${monthName(mk).toLowerCase()}`
+                  : `${over} af ${mineLimits.length} grænser er overskredet`}
+              </div>
+            )}
+          </div>
+        );
+      };
+
+      const EntryRow = ({ e }) => {
+        const set = (p) => changeEntry(e.id, { ...e, ...p });
+        const cycle = (field, order) => {
+          const cur = e[field] || order[0];
+          set({ [field]: order[(order.indexOf(cur) + 1) % order.length] });
+        };
+        return (
+          <div className="row">
+            <input className="cell cell-date" type="date" value={e.date} onChange={(ev) => set({ date: ev.target.value })} />
+            <input className="cell cell-name" value={e.name} placeholder="Hvad blev der købt?" onChange={(ev) => set({ name: ev.target.value })} />
+            <CatSelect cats={d.cats} className="cell cell-cat" value={e.catId} onChange={(catId) => set({ catId })} />
+            <button className={`payer p-${e.owner}`} onClick={() => cycle("owner", ["j", "a", "b"])} title="Er det en fælles eller personlig udgift?">
+              <span className="dot" />
+              {e.owner === "j" ? "Fælles" : N[e.owner]}
+            </button>
+            {e.owner === "j" && (
+              <button className={`payer ghost p-${e.payer}`} onClick={() => cycle("payer", ["a", "b", "j"])} title="Hvem lagde ud?">
+                <span className="dot" />
+                {e.payer === "j" ? "Fælles konto" : `Betalt af ${N[e.payer]}`}
+              </button>
+            )}
+            <input
+              className="cell cell-amount"
+              type="number"
+              inputMode="decimal"
+              placeholder="0"
+              value={e.amount === 0 ? "" : e.amount}
+              onChange={(ev) => set({ amount: ev.target.value === "" ? 0 : Number(ev.target.value) })}
+            />
+            <button className="del" onClick={() => deleteEntry(e.id)} aria-label="Slet postering">×</button>
+          </div>
+        );
+      };
+
+      const Limit = ({ l }) => {
+        const fill = l.cap > 0 ? Math.min(1, l.spent / l.cap) : 0;
+        const color = l.over ? "var(--warn)" : `var(--${l.owner})`;
+        const set = (p) => patch((s) => ({ limits: s.limits.map((x) => (x.id === l.id ? { ...x, ...p } : x)) }));
+        return (
+          <div className="limit">
+            <div className="limit-top">
+              <select className="cell cell-target" value={l.target} onChange={(e) => set({ target: e.target.value })}>
+                <optgroup label="Hele kategorien">
+                  {d.cats.map((g) => (
+                    <option key={g.id} value={"g:" + g.id}>{g.name} — alt</option>
+                  ))}
+                </optgroup>
+                {d.cats.map((g) => (
+                  <optgroup key={g.id} label={g.name}>
+                    {g.subs.map((s) => (<option key={s.id} value={"s:" + s.id}>{s.name}</option>))}
+                  </optgroup>
+                ))}
+              </select>
+              <span className="maxlabel">maks pr. md.</span>
+              <input
+                className="cell cell-amount"
+                type="number"
+                inputMode="decimal"
+                placeholder="0"
+                value={l.amount === 0 ? "" : l.amount}
+                onChange={(e) => set({ amount: e.target.value === "" ? 0 : Number(e.target.value) })}
+              />
+              <button className="del" onClick={() => patch((s) => ({ limits: s.limits.filter((x) => x.id !== l.id) }))} aria-label="Slet grænse">×</button>
+            </div>
+            <div className="bar limit-bar"><i style={{ width: `${fill * 100}%`, background: color }} /></div>
+            <div className="limit-meta">
+              <span>{kr(l.spent)} af {kr(l.cap)} brugt</span>
+              <span className={l.over ? "neg" : ""}>
+                {l.cap === 0 ? "Sæt et beløb" : l.over ? `${kr(-l.rest)} over` : `${kr(l.rest)} tilbage`}
+              </span>
+            </div>
+          </div>
+        );
+      };
+
+      const LimitCard = ({ owner, title, note, empty }) => {
+        const list = m.byOwner(owner);
+        const over = list.filter((l) => l.over).length;
+        return (
+          <div className="card">
+            <div className="head">
+              <div>
+                <h2 style={{ display: "flex", alignItems: "center", gap: 9 }}>
+                  <span className="swatch" style={{ background: `var(--${owner})` }} />
+                  {title}
+                </h2>
+                <p className="sub">{note}</p>
+              </div>
+              {over > 0 && <span className="tot alert">{over} overskredet</span>}
+            </div>
+            {list.length === 0 ? <p className="empty">{empty}</p> : list.map((l) => <Limit key={l.id} l={l} />)}
+            <button className="add" onClick={() => addLimit(owner)}>+ Sæt en grænse</button>
+          </div>
+        );
+      };
+
+      return (
+        <div className="wrap">
+          <style>{`
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Karla:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+.wrap{
+  --paper:#EAEEE5; --card:#FBFCF8; --ink:#1A211D; --muted:#6D776F; --line:#D6DBCC;
+  --a:#2F6E6A; --b:#A6486B; --j:#8A7A52; --warn:#B7552B;
+  --serif:'Fraunces',Georgia,serif; --sans:'Karla',system-ui,sans-serif; --mono:'IBM Plex Mono',ui-monospace,monospace;
+  background:var(--paper);color:var(--ink);font-family:var(--sans);min-height:100vh;
+  padding:28px 16px 64px;-webkit-font-smoothing:antialiased;
+}
+.wrap *{box-sizing:border-box}
+.inner{max-width:960px;margin:0 auto}
+
+.top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+h1{font-family:var(--serif);font-weight:600;font-size:40px;line-height:1;margin:6px 0 0;letter-spacing:-.02em}
+.headline{text-align:right}
+.headline .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.headline .v{font-family:var(--mono);font-size:26px;font-weight:500;font-variant-numeric:tabular-nums;margin-top:2px}
+.headline .v.neg{color:var(--warn)}
+
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-top:16px}
+h2{font-family:var(--serif);font-size:19px;font-weight:600;margin:0;letter-spacing:-.01em}
+.sub{font-size:12.5px;color:var(--muted);margin:3px 0 0}
+.head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+.head .tot{font-family:var(--mono);font-size:15px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.head .tot.alert{color:var(--warn);font-size:11.5px;letter-spacing:.04em;text-transform:uppercase}
+.linkbtn{background:none;border:none;font-family:var(--mono);font-size:11.5px;color:var(--muted);cursor:pointer;text-decoration:underline;text-underline-offset:3px;padding:0;white-space:nowrap}
+.linkbtn:hover{color:var(--ink)}
+
+.monthnav{display:flex;align-items:center;gap:6px}
+.monthnav button{background:none;border:1px solid var(--line);border-radius:999px;width:30px;height:30px;font-size:15px;color:var(--ink);cursor:pointer;line-height:1}
+.monthnav button:hover{background:var(--paper)}
+.monthnav .lbl{font-family:var(--mono);font-size:12.5px;min-width:118px;text-align:center}
+
+.beam-wrap{padding:24px 20px 20px}
+.beam-names{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.beam{position:relative;height:34px;margin:10px 0 4px}
+.beam .track{position:absolute;top:16px;left:0;right:0;height:2px;background:var(--line)}
+.beam .fill{position:absolute;top:16px;height:2px;transition:all .45s cubic-bezier(.2,.7,.3,1)}
+.beam .pin{position:absolute;top:0;left:50%;width:1px;height:34px;background:var(--line)}
+.beam .knob{position:absolute;top:7px;width:20px;height:20px;border-radius:50%;margin-left:-10px;border:2px solid var(--card);transition:left .45s cubic-bezier(.2,.7,.3,1),background .3s}
+.verdict{font-family:var(--serif);font-size:25px;line-height:1.25;margin-top:10px;letter-spacing:-.01em}
+.verdict .amt{font-family:var(--mono);font-weight:600;font-size:23px}
+.settle{margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.settle .btn{font-family:var(--sans);font-size:13px;font-weight:500;border:1px solid var(--ink);background:var(--ink);color:var(--card);border-radius:999px;padding:7px 15px;cursor:pointer}
+.settle .btn:hover{opacity:.86}
+.settled{font-family:var(--mono);font-size:11.5px;color:var(--muted);display:inline-flex;align-items:center;gap:6px}
+.settled button{background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;padding:0 2px}
+.settled button:hover{color:var(--warn)}
+
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;align-items:start}
+.pair .card{margin-top:0}
+.person .p-head{display:flex;align-items:center;gap:9px;margin-bottom:14px}
+.swatch{width:10px;height:10px;border-radius:50%;flex:none}
+.p-name{font-family:var(--serif);font-size:19px;font-weight:600;border:1px solid transparent;background:none;border-radius:7px;padding:3px 7px;width:100%;color:var(--ink)}
+.p-name:hover{border-color:var(--line)}
+.p-name:focus{outline:none;border-color:var(--ink);background:#fff}
+.p-line{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 0;font-size:14px}
+.p-line.quiet{color:var(--muted);font-size:13px}
+.p-line b{font-family:var(--mono);font-weight:400;font-variant-numeric:tabular-nums}
+.p-bar{height:5px;background:var(--line);border-radius:3px;overflow:hidden;margin:12px 0 10px}
+.p-bar i{display:block;height:100%;border-radius:3px;transition:width .4s ease}
+.p-left{display:flex;align-items:baseline;justify-content:space-between;padding-top:10px;border-top:1px solid var(--line)}
+.p-left span{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.p-left strong{font-family:var(--mono);font-size:21px;font-weight:500;font-variant-numeric:tabular-nums}
+.p-left strong.neg{color:var(--warn)}
+.p-note{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:9px}
+.p-note.neg{color:var(--warn)}
+
+.row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px dotted var(--line);flex-wrap:wrap}
+.cell{font-family:var(--sans);font-size:14px;color:var(--ink);background:transparent;border:1px solid transparent;border-radius:7px;padding:6px 8px}
+.cell:hover{border-color:var(--line)}
+.cell:focus{outline:none;border-color:var(--ink);background:#fff}
+.cell-name{flex:1 1 120px;min-width:90px}
+.cell-date{font-family:var(--mono);font-size:12px;width:132px;color:var(--muted)}
+.cell-cat{width:158px;font-size:12.5px;color:var(--muted);cursor:pointer}
+.cell-target{flex:1 1 150px;min-width:120px;font-size:13.5px;cursor:pointer}
+.cell-amount{font-family:var(--mono);font-size:14.5px;width:92px;text-align:right;font-variant-numeric:tabular-nums}
+.del{background:none;border:none;color:var(--line);font-size:19px;cursor:pointer;line-height:1;padding:0 4px}
+.del:hover{color:var(--warn)}
+
+.payer{display:inline-flex;align-items:center;gap:6px;font-family:var(--sans);font-size:12.5px;background:transparent;border:1px solid var(--line);border-radius:999px;padding:5px 11px;cursor:pointer;white-space:nowrap;color:var(--ink)}
+.payer .dot{width:7px;height:7px;border-radius:50%}
+.payer.p-a{color:var(--a);border-color:rgba(47,110,106,.35)} .payer.p-a .dot{background:var(--a)}
+.payer.p-b{color:var(--b);border-color:rgba(166,72,107,.35)} .payer.p-b .dot{background:var(--b)}
+.payer.p-j{color:var(--j);border-color:rgba(138,122,82,.35)} .payer.p-j .dot{background:var(--j)}
+.payer.ghost{font-size:11.5px;padding:4px 9px;opacity:.85}
+
+.freq{font-family:var(--mono);font-size:11px;background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:999px;padding:5px 10px;cursor:pointer;white-space:nowrap}
+.freq:hover{border-color:var(--ink);color:var(--ink)}
+.freq.f-q,.freq.f-y{border-style:dashed;color:var(--ink);border-color:var(--muted)}
+.permonth{flex-basis:100%;text-align:right;font-family:var(--mono);font-size:11px;color:var(--muted);padding:2px 26px 2px 0;margin-top:-2px}
+
+.chips{display:flex;gap:14px;flex-wrap:wrap;font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-bottom:12px}
+.chips span{display:inline-flex;align-items:center;gap:6px}
+.chips i{width:8px;height:8px;border-radius:50%;display:block}
+
+.limit{padding:13px 0;border-bottom:1px dotted var(--line)}
+.limit:first-of-type{padding-top:2px}
+.limit-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.maxlabel{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.limit-bar{margin-top:11px}
+.limit-meta{display:flex;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:6px;font-variant-numeric:tabular-nums}
+.limit-meta .neg{color:var(--warn)}
+
+.tabs{display:flex;gap:6px}
+.tabs button{font-family:var(--sans);font-size:12.5px;border:1px solid var(--line);background:none;border-radius:9px;padding:6px 12px;cursor:pointer;color:var(--muted)}
+.tabs button.on{border-color:var(--ink);color:var(--ink);background:#fff;font-weight:500}
+
+.grp{border-bottom:1px dotted var(--line);padding:12px 0}
+.grp-btn{display:flex;align-items:baseline;justify-content:space-between;gap:12px;width:100%;background:none;border:none;padding:0;cursor:pointer;text-align:left;color:var(--ink);font-family:var(--sans)}
+.grp-btn .nm{font-size:14.5px;display:flex;align-items:center;gap:7px}
+.grp-btn .chev{color:var(--muted);font-size:11px;transition:transform .2s}
+.grp-btn .chev.on{transform:rotate(90deg)}
+.grp-btn .amt{font-family:var(--mono);font-size:14px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.grp-btn .amt i{font-style:normal;color:var(--muted);font-size:12px}
+.stack{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--line);margin-top:8px}
+.stack i{display:block;height:100%;transition:width .4s ease}
+.subs{margin:10px 0 2px;padding-left:14px;border-left:1px solid var(--line)}
+.subline{display:flex;justify-content:space-between;gap:12px;font-size:13px;color:var(--muted);padding:3px 0}
+.subline b{font-family:var(--mono);font-weight:400;font-variant-numeric:tabular-nums;color:var(--ink)}
+.bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden}
+.bar i{display:block;height:100%;border-radius:3px;transition:width .4s ease}
+
+/* historik */
+.hist{display:flex;align-items:flex-end;gap:6px;height:132px;margin-top:4px}
+.histcol{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:6px;background:none;border:none;cursor:pointer;padding:0;height:100%}
+.histcol .col{width:100%;background:var(--line);border-radius:4px 4px 0 0;min-height:2px;transition:background .2s,height .4s ease}
+.histcol:hover .col{background:var(--muted)}
+.histcol.on .col{background:var(--ink)}
+.histcol .lb{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:.02em}
+.histcol.on .lb{color:var(--ink)}
+.histval{font-family:var(--mono);font-size:9.5px;color:var(--muted);height:12px}
+.yearline{display:flex;justify-content:space-between;align-items:baseline;margin-top:14px;padding-top:12px;border-top:1px solid var(--line);font-family:var(--mono);font-size:13px}
+.yearline span{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+
+.big{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px dotted var(--line);font-size:13.5px}
+.big:last-of-type{border-bottom:none}
+.big .when{font-family:var(--mono);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.big b{font-family:var(--mono);font-weight:400;font-variant-numeric:tabular-nums;white-space:nowrap}
+
+.cat-edit{padding:14px 0;border-bottom:1px dotted var(--line)}
+.cat-top{display:flex;align-items:center;gap:8px}
+.cat-name{font-family:var(--serif);font-size:17px;font-weight:600;border:1px solid transparent;background:none;border-radius:7px;padding:4px 8px;flex:1;color:var(--ink)}
+.cat-name:hover{border-color:var(--line)}
+.cat-name:focus{outline:none;border-color:var(--ink);background:#fff}
+.cat-subs{margin:6px 0 0;padding-left:14px;border-left:1px solid var(--line)}
+.cat-sub{display:flex;align-items:center;gap:6px}
+.sub-name{font-family:var(--sans);font-size:14px;border:1px solid transparent;background:none;border-radius:7px;padding:5px 8px;flex:1;color:var(--ink)}
+.sub-name:hover{border-color:var(--line)}
+.sub-name:focus{outline:none;border-color:var(--ink);background:#fff}
+.mini{background:none;border:none;font-family:var(--mono);font-size:11px;color:var(--muted);cursor:pointer;padding:6px 0 2px 8px;text-align:left}
+.mini:hover{color:var(--ink)}
+
+.add{margin-top:12px;background:none;border:1px dashed var(--line);border-radius:9px;padding:9px 14px;font-family:var(--sans);font-size:13px;color:var(--muted);cursor:pointer;width:100%}
+.add:hover{border-color:var(--ink);color:var(--ink)}
+.empty{font-size:13.5px;color:var(--muted);padding:8px 0;margin:0}
+
+.split{display:flex;gap:6px}
+.split button{font-family:var(--sans);font-size:12.5px;border:1px solid var(--line);background:none;border-radius:9px;padding:7px 13px;cursor:pointer;color:var(--muted)}
+.split button.on{border-color:var(--ink);color:var(--ink);background:#fff;font-weight:500}
+
+.foot{margin-top:22px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center}
+.foot p{font-family:var(--mono);font-size:11px;color:var(--muted);margin:0;max-width:540px;line-height:1.5}
+.err{background:#fff;border:1px solid var(--warn);color:var(--warn);border-radius:9px;padding:10px 14px;font-size:13px;margin-bottom:16px}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+
+@media (max-width:720px){
+  h1{font-size:31px}
+  .headline{text-align:left}
+  .pair{grid-template-columns:1fr}
+  .cell-cat{width:100%}
+  .cell-date{width:120px}
+  .cell-amount{width:80px}
+  .verdict{font-size:20px}
+  .hist{height:104px}
+  .histval{display:none}
+}
+@media (prefers-reduced-motion:reduce){.wrap *{transition:none!important}}
+          `}</style>
+
+          <div className="inner">
+            <div className="top">
+              <div>
+                <div className="eyebrow">{monthName(mk)}</div>
+                <h1>Vores budget</h1>
+              </div>
+              <div className="headline">
+                <div className="k">Tilbage denne måned</div>
+                <div className={`v ${m.income - m.total < 0 ? "neg" : ""}`}>{kr(m.income - m.total)}</div>
+              </div>
+            </div>
+
+            {error && <div className="err">{error}</div>}
+
+            {loading ? (
+              <div className="card"><p className="empty">Henter jeres tal…</p></div>
+            ) : (
+              <>
+                {/* samlet overblik */}
+                <div className="card">
+                  <div className="head">
+                    <div>
+                      <h2>Overblik</h2>
+                      <p className="sub">Faste udgifter fra budgettet plus det, I har registreret i {monthName(mk).toLowerCase()}.</p>
+                    </div>
+                    <div className="monthnav">
+                      <button onClick={() => setMk(shiftMonth(mk, -1))} aria-label="Forrige måned">‹</button>
+                      <span className="lbl">{monthName(mk)}</span>
+                      <button onClick={() => setMk(shiftMonth(mk, 1))} aria-label="Næste måned">›</button>
+                    </div>
+                  </div>
+                  <div className="chips">
+                    <span><i style={{ background: "var(--ink)" }} />Indtægt {kr(m.income)}</span>
+                    <span><i style={{ background: "var(--muted)" }} />Faste udgifter {kr(m.planTotal)}</span>
+                    <span><i style={{ background: "var(--warn)" }} />Registreret forbrug {kr(m.eTotal)}</span>
+                  </div>
+                  <div className="p-line"><span>Udgifter i alt</span><b>{kr(m.total)}</b></div>
+                  <div className="p-left" style={{ marginTop: 6 }}>
+                    <span>Tilbage</span>
+                    <strong className={m.income - m.total < 0 ? "neg" : ""}>{kr(m.income - m.total)}</strong>
+                  </div>
+                </div>
+
+                {/* vippen */}
+                <div className="card beam-wrap">
+                  <div className="beam-names"><span>{N.a}</span><span>{N.b}</span></div>
+                  <div className="beam">
+                    <div className="track" />
+                    <div className="pin" />
+                    <div
+                      className="fill"
+                      style={{
+                        left: `${tilt < 0 ? 50 + tilt * 100 : 50}%`,
+                        width: `${Math.abs(tilt) * 100}%`,
+                        background: debtor ? beamColor : "transparent",
+                      }}
+                    />
+                    <div className="knob" style={{ left: `${50 + tilt * 100}%`, background: beamColor }} />
+                  </div>
+                  <div className="verdict">
+                    {debtor ? (
+                      <>{N[debtor]} skylder {N[debtor === "a" ? "b" : "a"]} <span className="amt">{kr(Math.abs(m.balanceA))}</span></>
+                    ) : m.pool > 0 ? (<>I er kvit i {monthName(mk).toLowerCase()}.</>) : (<>Ingen fælles udlæg at afregne.</>)}
+                  </div>
+                  <div className="settle">
+                    {debtor && <button className="btn" onClick={settle}>Marker som afregnet</button>}
+                    {monthSettlements.map((s) => (
+                      <span className="settled" key={s.id}>
+                        {N[s.from]} betalte {kr(s.amount)} d. {dayLabel(s.date)}
+                        <button
+                          onClick={() => patch((st) => ({ settlements: st.settlements.filter((x) => x.id !== s.id) }))}
+                          aria-label="Fortryd afregning"
+                        >×</button>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+
+                {/* personkort */}
+                <div className="pair"><Person p="a" /><Person p="b" /></div>
+
+                {/* månedens posteringer */}
+                <div className="card">
+                  <div className="head">
+                    <div>
+                      <h2>Forbrug i {monthName(mk).toLowerCase()}</h2>
+                      <p className="sub">Skriv de køb ind, I laver hen ad vejen — dato, kategori og hvem der betalte.</p>
+                    </div>
+                    <span className="tot">{kr(m.eTotal)}</span>
+                  </div>
+                  <div className="chips">
+                    <span><i style={{ background: "var(--j)" }} />Fælles {kr(m.eShared)}</span>
+                    <span><i style={{ background: "var(--a)" }} />{N.a} {kr(m.eMine)}</span>
+                    <span><i style={{ background: "var(--b)" }} />{N.b} {kr(m.eTheirs)}</span>
+                  </div>
+                  {m.entries.length === 0 ? (
+                    <p className="empty">Ingen posteringer i {monthName(mk).toLowerCase()} endnu.</p>
+                  ) : (
+                    [...m.entries]
+                      .sort((x, y) => (x.date || "").localeCompare(y.date || ""))
+                      .map((e) => <EntryRow key={e.id} e={e} />)
+                  )}
+                  <button className="add" onClick={addEntry}>+ Tilføj postering</button>
+                </div>
+
+                {/* grænser */}
+                <div className="pair">
+                  <LimitCard
+                    owner="a"
+                    title={`${N.a}s grænser`}
+                    note={`Måler dit forbrug i ${monthName(mk).toLowerCase()}`}
+                    empty="Ingen grænser sat. Fx maks. 1.500 til tøj og shopping."
+                  />
+                  <LimitCard
+                    owner="b"
+                    title={`${N.b}s grænser`}
+                    note={`Måler hendes eller hans forbrug i ${monthName(mk).toLowerCase()}`}
+                    empty="Ingen grænser sat endnu."
+                  />
+                </div>
+                <LimitCard
+                  owner="j"
+                  title="Fælles grænser"
+                  note={`Måler jeres fælles forbrug i ${monthName(mk).toLowerCase()}`}
+                  empty="Ingen grænser sat. Fx maks. 4.000 til dagligvarer."
+                />
+
+                {/* kategorier */}
+                <div className="card">
+                  <div className="head">
+                    <div>
+                      <h2>Kategorier</h2>
+                      <p className="sub">Klik på en kategori for at se underkategorierne.</p>
+                    </div>
+                    <div className="tabs">
+                      <button className={catMode === "actual" ? "on" : ""} onClick={() => setCatMode("actual")}>Forbrug</button>
+                      <button className={catMode === "plan" ? "on" : ""} onClick={() => setCatMode("plan")}>Faste udgifter</button>
+                    </div>
+                  </div>
+                  <div className="chips">
+                    <span><i style={{ background: "var(--j)" }} />Fælles</span>
+                    <span><i style={{ background: "var(--a)" }} />{N.a}</span>
+                    <span><i style={{ background: "var(--b)" }} />{N.b}</span>
+                    <span style={{ marginLeft: "auto" }}>{kr(m.srcTotal)} i alt</span>
+                  </div>
+                  {m.groups.length === 0 ? (
+                    <p className="empty">
+                      {catMode === "actual"
+                        ? `Ingen posteringer i ${monthName(mk).toLowerCase()} endnu.`
+                        : "Læg jeres faste udgifter ind nedenfor."}
+                    </p>
+                  ) : (
+                    m.groups.map((g) => {
+                      const isOpen = !!open[g.id];
+                      const w = (v) => (g.total ? (v / g.total) * (g.total / m.groupMax) * 100 : 0);
+                      return (
+                        <div className="grp" key={g.id}>
+                          <button className="grp-btn" onClick={() => setOpen((o) => ({ ...o, [g.id]: !o[g.id] }))} aria-expanded={isOpen}>
+                            <span className="nm">
+                              <span className={`chev ${isOpen ? "on" : ""}`}>▸</span>
+                              {g.name}
+                            </span>
+                            <span className="amt">
+                              {kr(g.total)} <i>{m.srcTotal ? Math.round((g.total / m.srcTotal) * 100) : 0}%</i>
+                            </span>
+                          </button>
+                          <div className="stack">
+                            <i style={{ width: `${w(g.parts.j)}%`, background: "var(--j)" }} />
+                            <i style={{ width: `${w(g.parts.a)}%`, background: "var(--a)" }} />
+                            <i style={{ width: `${w(g.parts.b)}%`, background: "var(--b)" }} />
+                          </div>
+                          {isOpen && (
+                            <div className="subs">
+                              {g.subs.map(([s, v]) => (
+                                <div className="subline" key={s}><span>{s}</span><b>{kr(v)}</b></div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                  <button className="add" onClick={() => setEditCats((s) => !s)}>
+                    {editCats ? "Færdig med at redigere" : "Rediger kategorier"}
+                  </button>
+                </div>
+
+                {/* kategori-editor */}
+                {editCats && (
+                  <div className="card">
+                    <div className="head">
+                      <div>
+                        <h2>Rediger kategorier</h2>
+                        <p className="sub">Skriv direkte i navnene. Sletter I noget, flytter posteringerne med over i den første kategori på listen.</p>
+                      </div>
+                    </div>
+                    {d.cats.map((g) => (
+                      <div className="cat-edit" key={g.id}>
+                        <div className="cat-top">
+                          <input className="cat-name" value={g.name} onChange={(e) => renameGroup(g.id, e.target.value)} />
+                          <button className="del" onClick={() => deleteGroup(g.id)} aria-label="Slet kategori">×</button>
+                        </div>
+                        <div className="cat-subs">
+                          {g.subs.map((s) => (
+                            <div className="cat-sub" key={s.id}>
+                              <input className="sub-name" value={s.name} onChange={(e) => renameSub(g.id, s.id, e.target.value)} />
+                              <button className="del" onClick={() => deleteSub(g.id, s.id)} aria-label="Slet underkategori">×</button>
+                            </div>
+                          ))}
+                          <button className="mini" onClick={() => addSub(g.id)}>+ underkategori</button>
+                        </div>
+                      </div>
+                    ))}
+                    <button className="add" onClick={addGroup}>+ Ny overkategori</button>
+                  </div>
+                )}
+
+                {/* historik */}
+                <div className="card">
+                  <div className="head">
+                    <div>
+                      <h2>Måned for måned</h2>
+                      <p className="sub">Registreret forbrug. Klik på en søjle for at åbne måneden.</p>
+                    </div>
+                  </div>
+                  <div className="hist">
+                    {m.hist.map((h) => (
+                      <button
+                        key={h.mk}
+                        className={`histcol ${h.mk === mk ? "on" : ""}`}
+                        onClick={() => setMk(h.mk)}
+                        title={`${monthName(h.mk)}: ${kr(h.total)}`}
+                      >
+                        <span className="histval">{h.total > 0 ? Math.round(h.total / 1000) + "k" : ""}</span>
+                        <span className="col" style={{ height: `${(h.total / m.histMax) * 100}%` }} />
+                        <span className="lb">{shortMonth(h.mk)}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="yearline">
+                    <span>Forbrug i {m.year}</span>
+                    <b>
+                      {kr(m.yearTotal)}
+                      {m.yearMonths > 0 && (
+                        <span style={{ color: "var(--muted)" }}> · {kr(m.yearTotal / m.yearMonths)} pr. måned</span>
+                      )}
+                    </b>
+                  </div>
+                </div>
+
+                {/* budgettet */}
+                <div className="card">
+                  <div className="head">
+                    <div>
+                      <h2>Faste udgifter</h2>
+                      <p className="sub">De beløb der går igen hver måned, kvartal eller år.</p>
+                    </div>
+                    <button className="linkbtn" onClick={() => setShowPlan((s) => !s)}>
+                      {showPlan ? "Skjul" : `Vis og rediger · ${kr(m.planTotal)}`}
+                    </button>
+                  </div>
+
+                  {showPlan && (
+                    <>
+                      <div className="head" style={{ marginTop: 6 }}>
+                        <p className="sub">Fælles — knappen viser, hvem beløbet trækkes hos</p>
+                        <span className="tot">{kr(m.planShared)}</span>
+                      </div>
+                      <PlanList
+                        items={d.shared}
+                        cats={d.cats}
+                        payerNames={N}
+                        empty="Husleje, forsikring, internet — alt det, I betaler sammen."
+                        addLabel="+ Tilføj fælles fast udgift"
+                        {...listOps("shared")}
+                      />
+
+                      <div className="head" style={{ marginTop: 22 }}>
+                        <p className="sub" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <span className="swatch" style={{ background: "var(--a)" }} />
+                          {N.a}
+                        </p>
+                        <span className="tot">{kr(m.planMine)}</span>
+                      </div>
+                      <PlanList
+                        items={d.mine}
+                        cats={d.cats}
+                        empty="Faste udgifter der kun er dine."
+                        addLabel="+ Tilføj fast udgift"
+                        {...listOps("mine")}
+                      />
+
+                      <div className="head" style={{ marginTop: 22 }}>
+                        <p className="sub" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <span className="swatch" style={{ background: "var(--b)" }} />
+                          {N.b}
+                        </p>
+                        <span className="tot">{kr(m.planTheirs)}</span>
+                      </div>
+                      <PlanList
+                        items={d.theirs}
+                        cats={d.cats}
+                        empty="Faste udgifter der kun hører til her."
+                        addLabel="+ Tilføj fast udgift"
+                        {...listOps("theirs")}
+                      />
+
+                      <div className="head" style={{ marginTop: 22, marginBottom: 0 }}>
+                        <p className="sub">Sådan deler I de fælles udgifter</p>
+                        <div className="split">
+                          <button className={d.split === "even" ? "on" : ""} onClick={() => patch(() => ({ split: "even" }))}>50/50</button>
+                          <button className={d.split === "income" ? "on" : ""} onClick={() => patch(() => ({ split: "income" }))}>Efter indkomst</button>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {/* store, sjældne betalinger */}
+                {m.uneven.length > 0 && (
+                  <div className="card">
+                    <div className="head">
+                      <div>
+                        <h2>Betalinger der ikke falder hver måned</h2>
+                        <p className="sub">Beløbene er fordelt ud i budgettet. Her står de, som de faktisk trækkes.</p>
+                      </div>
+                      <span className="tot">{kr(m.uneven.reduce((s, x) => s + perMonth(x), 0))} / md.</span>
+                    </div>
+                    {m.uneven.map((x) => (
+                      <div className="big" key={x.id}>
+                        <span>{x.name || "Uden navn"} <span className="when">{FREQ[x.freq].long}</span></span>
+                        <b>{kr(x.amount)} <span className="when">= {kr(perMonth(x))}/md.</span></b>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="foot">
+                  <p>
+                    Faste udgifter regnes om til kroner pr. måned. Tallene deles mellem alle, der åbner siden —
+                    så hold kontonumre og andet følsomt udenfor.
+                  </p>
+                  <button className="linkbtn" onClick={() => setShowReset((s) => !s)}>
+                    {showReset ? "Skjul" : "Nulstil alt"}
+                  </button>
+                </div>
+                {showReset && (
+                  <div className="card">
+                    <h2>Nulstil</h2>
+                    <p className="sub" style={{ marginBottom: 12 }}>
+                      Sletter navne, indtægter, grænser, egne kategorier, posteringer og alle faste udgifter.
+                    </p>
+                    <button className="add" onClick={wipe} style={{ borderColor: "var(--warn)", color: "var(--warn)" }}>
+                      Slet alle tal
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Storage implementation — Supabase cloud only                      */
+    /* ------------------------------------------------------------------ */
+
+    const SUPABASE_URL = "https://kjzkcnjvgmmycpebxgez.supabase.co";
+    const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_Igci9zcJYexX1WfSZVQXQg_aOfS9CbI";
+    const BUDGET_ID = "vores-budget";
+    const BUDGET_ACCESS_TOKEN = "faelles-budget-cloud-v1";
+
+    const supabaseClient = window.supabase.createClient(
+      SUPABASE_URL,
+      SUPABASE_PUBLISHABLE_KEY
+    );
+
+    let lastCloudValue = null;
+
+    async function readCloudValue() {
+      const { data, error } = await supabaseClient.rpc("get_shared_budget", {
+        p_budget_id: BUDGET_ID,
+        p_access_token: BUDGET_ACCESS_TOKEN,
+      });
+
+      if (error) {
+        console.error("Supabase get_shared_budget:", error);
+        throw new Error(`Supabase kunne ikke hente budgettet: ${error.message || "ukendt fejl"}`);
+      }
+      return data ? JSON.stringify(data) : null;
+    }
+
+    window.storage = {
+      async get(key, unused) {
+        const value = await readCloudValue();
+        lastCloudValue = value;
+        return { value };
+      },
+
+      async set(key, value, unused) {
+        try {
+          const payload = JSON.parse(value);
+          const { error } = await supabaseClient.rpc("save_shared_budget", {
+            p_budget_id: BUDGET_ID,
+            p_access_token: BUDGET_ACCESS_TOKEN,
+            p_payload: payload,
+          });
+
+          if (error) {
+            console.error("Supabase save_shared_budget:", error);
+            throw new Error(error.message || "ukendt Supabase-fejl");
+          }
+
+          lastCloudValue = value;
+          return true;
+        } catch (err) {
+          console.error("Cloud save failed:", err);
+          throw new Error(`Supabase kunne ikke gemme budgettet: ${err.message || "ukendt fejl"}`);
+        }
+      },
+
+      subscribe(onValue) {
+        let stopped = false;
+        let busy = false;
+
+        const check = async () => {
+          if (stopped || busy) return;
+          busy = true;
+          try {
+            const value = await readCloudValue();
+            if (value !== null && value !== lastCloudValue) {
+              lastCloudValue = value;
+              onValue(value);
+            }
+          } catch (err) {
+            console.error("Cloud sync failed:", err);
+          } finally {
+            busy = false;
+          }
+        };
+
+        check();
+        const timer = setInterval(check, 1500);
+
+        return () => {
+          stopped = true;
+          clearInterval(timer);
+        };
+      },
+
+      async list(prefix, unused) {
+        return { keys: [] };
+      },
+
+      async delete(key, unused) {
+        const { error } = await supabaseClient.rpc("delete_shared_budget", {
+          p_budget_id: BUDGET_ID,
+          p_access_token: BUDGET_ACCESS_TOKEN,
+        });
+
+        if (error) {
+          console.error("Supabase delete_shared_budget:", error);
+          throw new Error(`Supabase kunne ikke nulstille budgettet: ${error.message || "ukendt fejl"}`);
+        }
+
+        lastCloudValue = null;
+        return true;
+      }
+    };
+
+    /* Render the app */
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<Budget />);
+  </script>
+</body>
+</html>
